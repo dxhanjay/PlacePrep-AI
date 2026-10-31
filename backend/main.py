@@ -243,7 +243,7 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
 
 @app.get("/")
 def health():
-    return {"status": "ok", "project": "PlacePrep AI", "sprint": 3,
+    return {"status": "ok", "project": "PlacePrep AI", "sprint": 4,
             "storage": "supabase" if DB_ENABLED else "memory"}
 
 @app.post("/auth/signup")
@@ -464,7 +464,10 @@ async def upload_resume(file: UploadFile = File(...), user=Depends(get_current_u
         "uploaded_at": datetime.utcnow().isoformat(),
     }
     db_save_resume(user["email"], record)
-    db_clear_ats(user["email"])  # previous score no longer matches this resume
+    # Note: the previous ATS result is kept (it records the filename it was
+    # computed on) instead of being wiped on every re-upload — students
+    # re-upload often while fixing their resume, and a vanished score reads
+    # as data loss. Running a new analysis overwrites it.
     return {
         "message": "Resume uploaded and parsed",
         "filename": record["filename"],
