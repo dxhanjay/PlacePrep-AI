@@ -1,19 +1,21 @@
 """
-PlacePrep AI - Backend (Sprint 1 + Sprint 2)
+PlacePrep AI - Backend (Sprints 1-3)
 FastAPI: Health, Signup, Login (JWT), Me, Dashboard Stats,
          Resume Upload (PDF) + Text Extraction + ATS Scoring vs a Job Description
 Run: uvicorn main:app --reload --port 8000
 Docs: http://localhost:8000/docs
-NOTE: Users, resumes and ATS results are stored in memory so the app runs
-      instantly anywhere. A later sprint connects Supabase Postgres
-      (schema in /database/schema.sql) to make them permanent.
+Storage: Supabase Postgres via PostgREST when SUPABASE_URL + SUPABASE_KEY
+are set (required on serverless hosts), in-memory fallback for local dev.
+App tables: database/sprint3_app_tables.sql
 """
 import io
+import json
 import os
 import re
 from datetime import datetime, timedelta
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,7 +42,126 @@ app.add_middleware(
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
-users_db = {}  # email -> user dict (Sprint 1 only)
+
+# ---------------------------------------------------------------------------
+# Storage (Sprint 3): Supabase PostgREST when SUPABASE_URL + SUPABASE_KEY are
+# configured; otherwise in-memory dicts so local development still runs with
+# zero setup. Serverless deployments MUST use Supabase: each function instance
+# has its own memory, so in-memory users made uploads fail with
+# "User not found" whenever a request landed on a different instance.
+# ---------------------------------------------------------------------------
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY") or ""
+DB_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
+
+users_db = {}    # fallback only (local dev without Supabase)
+resumes_db = {}  # fallback only
+ats_db = {}      # fallback only
+
+
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _sb_get_one(table: str, email: str):
+    with httpx.Client(timeout=10) as client:
+        res = client.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_sb_headers(),
+            params={"email": f"eq.{email}", "select": "*"},
+        )
+        res.raise_for_status()
+        rows = res.json()
+        return rows[0] if rows else None
+
+
+def _sb_upsert(table: str, row: dict):
+    headers = _sb_headers()
+    headers["Prefer"] = "resolution=merge-duplicates"
+    with httpx.Client(timeout=10) as client:
+        res = client.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=headers, json=row)
+        res.raise_for_status()
+
+
+def _sb_delete(table: str, email: str):
+    with httpx.Client(timeout=10) as client:
+        res = client.delete(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_sb_headers(),
+            params={"email": f"eq.{email}"},
+        )
+        res.raise_for_status()
+
+
+def db_get_user(email: str):
+    if DB_ENABLED:
+        return _sb_get_one("app_users", email)
+    return users_db.get(email)
+
+
+def db_create_user(user: dict):
+    if DB_ENABLED:
+        _sb_upsert("app_users", user)
+    else:
+        users_db[user["email"]] = user
+
+
+def db_get_resume(email: str):
+    if DB_ENABLED:
+        row = _sb_get_one("app_resumes", email)
+        if not row:
+            return None
+        return {
+            "filename": row["filename"],
+            "text": row["resume_text"],
+            "word_count": row["word_count"],
+            "skills": row["skills"] or [],
+            "uploaded_at": row["uploaded_at"],
+        }
+    return resumes_db.get(email)
+
+
+def db_save_resume(email: str, record: dict):
+    if DB_ENABLED:
+        _sb_upsert("app_resumes", {
+            "email": email,
+            "filename": record["filename"],
+            "resume_text": record["text"],
+            "word_count": record["word_count"],
+            "skills": record["skills"],
+            "uploaded_at": record["uploaded_at"],
+        })
+    else:
+        resumes_db[email] = record
+
+
+def db_get_ats(email: str):
+    if DB_ENABLED:
+        row = _sb_get_one("app_ats", email)
+        return row["result"] if row else None
+    return ats_db.get(email)
+
+
+def db_save_ats(email: str, result: dict):
+    if DB_ENABLED:
+        _sb_upsert("app_ats", {
+            "email": email,
+            "result": result,
+            "analyzed_at": result.get("analyzed_at") or datetime.utcnow().isoformat(),
+        })
+    else:
+        ats_db[email] = result
+
+
+def db_clear_ats(email: str):
+    if DB_ENABLED:
+        _sb_delete("app_ats", email)
+    else:
+        ats_db.pop(email, None)
 
 class SignupRequest(BaseModel):
     name: str
@@ -62,18 +183,19 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
         email = payload.get("sub")
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
-    user = users_db.get(email)
+    user = db_get_user(email)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
 @app.get("/")
 def health():
-    return {"status": "ok", "project": "PlacePrep AI", "sprint": 1}
+    return {"status": "ok", "project": "PlacePrep AI", "sprint": 3,
+            "storage": "supabase" if DB_ENABLED else "memory"}
 
 @app.post("/auth/signup")
 def signup(data: SignupRequest):
-    if data.email in users_db:
+    if db_get_user(data.email):
         raise HTTPException(status_code=400, detail="Email already registered")
     if len(data.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
@@ -82,13 +204,13 @@ def signup(data: SignupRequest):
         "hashed_password": pwd_context.hash(data.password),
         "created_at": datetime.utcnow().isoformat(),
     }
-    users_db[data.email] = user
+    db_create_user(user)
     return {"message": "Signup successful", "token": create_token(data.email),
             "user": {"name": user["name"], "email": user["email"], "role": user["role"]}}
 
 @app.post("/auth/login")
 def login(data: LoginRequest):
-    user = users_db.get(data.email)
+    user = db_get_user(data.email)
     if not user or not pwd_context.verify(data.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     return {"message": "Login successful", "token": create_token(data.email),
@@ -101,8 +223,8 @@ def me(user=Depends(get_current_user)):
 @app.get("/dashboard/stats")
 def dashboard_stats(user=Depends(get_current_user)):
     email = user["email"]
-    last_ats = ats_db.get(email)
-    has_resume = email in resumes_db
+    last_ats = db_get_ats(email)
+    has_resume = db_get_resume(email) is not None
     if last_ats:
         weak = [f"Missing skill: {s}" for s in last_ats["missing_skills"][:3]]
         weak_topics = weak or ["No major skill gaps against your last JD"]
@@ -123,9 +245,6 @@ def dashboard_stats(user=Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 # Sprint 2: Resume upload + ATS scoring
 # ---------------------------------------------------------------------------
-resumes_db = {}  # email -> {filename, text, word_count, skills, uploaded_at}
-ats_db = {}      # email -> last ATS analysis result
-
 SKILL_KEYWORDS = [
     "python", "sql", "java", "javascript", "typescript", "c++", "c#", "golang",
     "react", "next.js", "node.js", "express", "fastapi", "flask", "django",
@@ -278,8 +397,8 @@ async def upload_resume(file: UploadFile = File(...), user=Depends(get_current_u
         "skills": find_skills(text),
         "uploaded_at": datetime.utcnow().isoformat(),
     }
-    resumes_db[user["email"]] = record
-    ats_db.pop(user["email"], None)  # previous score no longer matches this resume
+    db_save_resume(user["email"], record)
+    db_clear_ats(user["email"])  # previous score no longer matches this resume
     return {
         "message": "Resume uploaded and parsed",
         "filename": record["filename"],
@@ -291,7 +410,7 @@ async def upload_resume(file: UploadFile = File(...), user=Depends(get_current_u
 
 @app.get("/resume/me")
 def my_resume(user=Depends(get_current_user)):
-    record = resumes_db.get(user["email"])
+    record = db_get_resume(user["email"])
     if not record:
         return {"has_resume": False}
     return {
@@ -300,13 +419,13 @@ def my_resume(user=Depends(get_current_user)):
         "word_count": record["word_count"],
         "skills_detected": record["skills"],
         "uploaded_at": record["uploaded_at"],
-        "last_ats": ats_db.get(user["email"]),
+        "last_ats": db_get_ats(user["email"]),
     }
 
 
 @app.post("/resume/ats")
 def ats_check(data: ATSRequest, user=Depends(get_current_user)):
-    record = resumes_db.get(user["email"])
+    record = db_get_resume(user["email"])
     if not record:
         raise HTTPException(status_code=400, detail="Upload your resume first")
     if len(data.job_description.strip()) < 50:
@@ -314,5 +433,5 @@ def ats_check(data: ATSRequest, user=Depends(get_current_user)):
     result = analyze_resume(record["text"], data.job_description)
     result["filename"] = record["filename"]
     result["analyzed_at"] = datetime.utcnow().isoformat()
-    ats_db[user["email"]] = result
+    db_save_ats(user["email"], result)
     return result
