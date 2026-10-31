@@ -4,17 +4,17 @@
 ![Next.js](https://img.shields.io/badge/Next.js-14-000000?style=flat&logo=nextdotjs&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat&logo=fastapi&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/DB-Supabase%20%2F%20PostgreSQL-4169E1?style=flat&logo=postgresql&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Sprint%201%20complete-yellow?style=flat)
+![Status](https://img.shields.io/badge/Status-Sprint%202%20complete-brightgreen?style=flat)
 
 BTech CSE Final-Year Major Project — GD Goenka University, Gurugram.
 A placement-preparation platform for final-year students: resume ATS analysis against a job description, real-time AI mock interviews with feedback, and a student readiness dashboard.
 
-> **Current status (honest):** Sprint 1 is complete (auth + dashboard + schema). Resume upload with ATS scoring and the AI mock-interview modules are **in progress** (Sprint 2+), not yet built.
+> **Current status (honest):** Sprints 1–2 are complete and live (auth, dashboard, resume upload + ATS scoring). The AI mock-interview module is **in progress** (Sprint 4+), not yet built. Users, resumes and ATS results are currently stored in memory — the database sprint (schema in `database/schema.sql`) will make them permanent.
 
 ## 🌐 Live Demo
-- **App:** https://placeprep-ai-cyan.vercel.app — use Sign Up to create an account and try the dashboard
+- **App:** https://placeprep-ai-cyan.vercel.app — use Sign Up to create an account, upload your resume PDF, and run an ATS check against any job description
 - **API:** https://placeprep-ai-backend.vercel.app · interactive docs at [/docs](https://placeprep-ai-backend.vercel.app/docs)
-- Deployed on Vercel (frontend: Next.js project; backend: FastAPI as a serverless function via `backend/api/index.py`). Sprint 1 stores users in memory, so accounts reset when the backend restarts — the Sprint 2 database removes this limit.
+- Deployed on Vercel (frontend: Next.js project; backend: FastAPI as a serverless function via `backend/api/index.py`).
 
 ## What is DONE in Sprint 1
 - [x] Landing page
@@ -62,9 +62,10 @@ placeprep-ai/
 
 ## Roadmap
 - [x] **Sprint 1** — Landing, signup/login (JWT + bcrypt), protected dashboard, Supabase schema
-- [ ] **Sprint 2** — Resume upload (PDF) + text extraction + ATS score vs job description
-- [ ] **Sprint 3** — AI mock interview (voice-based) with scoring and feedback
-- [ ] **Sprint 4** — Readiness dashboard analytics, TPO/admin view, deployment
+- [x] **Sprint 2** — Resume upload (PDF) + text extraction + ATS score vs job description (skill match, sections, length, action verbs) — live
+- [ ] **Sprint 3** — Database persistence (Supabase) + saved ATS history
+- [ ] **Sprint 4** — AI mock interview with scoring and feedback
+- [ ] **Sprint 5** — Readiness analytics, TPO/admin view
 
 ## Deployment (Final Sprint)
 Frontend -> Vercel | Backend -> Render | DB -> Supabase (all free)

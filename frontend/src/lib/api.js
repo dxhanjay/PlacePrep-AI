@@ -9,6 +9,18 @@ export async function apiPost(path, body, token) {
   if (!res.ok) throw new Error(data.detail || "Something went wrong");
   return data;
 }
+export async function apiUpload(path, file, token) {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${API}${path}`, {
+    method: "POST",
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: form,
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || "Upload failed");
+  return data;
+}
 export async function apiGet(path, token) {
   const res = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${token}` } });
   const data = await res.json();
