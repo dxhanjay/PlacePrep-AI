@@ -24,9 +24,12 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 1 day
 
 app = FastAPI(title="PlacePrep AI API", version="1.0-sprint1")
+# Allowed frontend origins: comma-separated env var for deployment,
+# defaults to the local Next.js dev server.
+_allowed = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[o.strip() for o in _allowed.split(",") if o.strip()],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
