@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+.next/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Environment (never commit real secrets — use the .example files)
+.env
+.env.local
+*.env
+!.env.example
+!.env.local.example
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

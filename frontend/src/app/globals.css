@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+body { background:#F8FAFC; color:#0F172A; font-family: system-ui, sans-serif; }
+.btn { @apply bg-indigo-600 text-white px-5 py-2.5 rounded-lg font-medium hover:bg-indigo-700 transition; }
+.input { @apply w-full border rounded-lg px-4 py-2.5 mt-1 focus:outline-none focus:ring-2 focus:ring-indigo-500; }
+.card { @apply bg-white rounded-xl shadow-sm border p-6; }
