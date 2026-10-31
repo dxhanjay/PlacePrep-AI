@@ -11,7 +11,9 @@ App tables: database/sprint3_app_tables.sql
 import io
 import json
 import os
+import random
 import re
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -163,6 +165,57 @@ def db_clear_ats(email: str):
     else:
         ats_db.pop(email, None)
 
+
+interviews_db = {}  # fallback only: session id -> interview state
+
+
+def _sb_list_interviews(email: str):
+    with httpx.Client(timeout=10) as client:
+        res = client.get(
+            f"{SUPABASE_URL}/rest/v1/app_interviews",
+            headers=_sb_headers(),
+            params={"email": f"eq.{email}", "select": "*", "order": "created_at.desc"},
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+def db_create_interview(state: dict):
+    if DB_ENABLED:
+        _sb_upsert("app_interviews", {
+            "id": state["id"], "email": state["email"], "track": state["track"],
+            "state": state, "created_at": state["created_at"],
+            "updated_at": state["updated_at"],
+        })
+    else:
+        interviews_db[state["id"]] = state
+
+
+def db_get_interview(session_id: str):
+    if DB_ENABLED:
+        with httpx.Client(timeout=10) as client:
+            res = client.get(
+                f"{SUPABASE_URL}/rest/v1/app_interviews",
+                headers=_sb_headers(),
+                params={"id": f"eq.{session_id}", "select": "*"},
+            )
+            res.raise_for_status()
+            rows = res.json()
+            return rows[0]["state"] if rows else None
+    return interviews_db.get(session_id)
+
+
+def db_update_interview(state: dict):
+    state["updated_at"] = datetime.utcnow().isoformat()
+    db_create_interview(state)
+
+
+def db_list_interviews(email: str):
+    if DB_ENABLED:
+        return [row["state"] for row in _sb_list_interviews(email)]
+    mine = [s for s in interviews_db.values() if s["email"] == email]
+    return sorted(mine, key=lambda s: s["created_at"], reverse=True)
+
 class SignupRequest(BaseModel):
     name: str
     email: EmailStr
@@ -232,10 +285,23 @@ def dashboard_stats(user=Depends(get_current_user)):
         weak_topics = ["Run an ATS check against a job description"]
     else:
         weak_topics = ["Upload your resume to unlock your ATS score"]
+    sessions = db_list_interviews(email)
+    completed = [s for s in sessions if s.get("status") == "completed" and s.get("summary")]
+    interview_avg = (sum(s["summary"]["overall_score"] for s in completed) / len(completed)) if completed else None
+    ats_score = last_ats["score"] if last_ats else 0
+    # Readiness blends the two things a student controls: resume strength and
+    # interview performance. Each contributes up to 50 points.
+    readiness = 0
+    if last_ats:
+        readiness += round(ats_score * 0.5)
+    if interview_avg is not None:
+        readiness += round(interview_avg * 0.5)
     return {
         "user": user["name"],
-        "ats_score": last_ats["score"] if last_ats else 0,
-        "interviews_completed": 0, "readiness_score": 0,
+        "ats_score": ats_score,
+        "interviews_completed": len(completed),
+        "last_interview_score": round(interview_avg) if interview_avg is not None else None,
+        "readiness_score": readiness,
         "has_resume": has_resume,
         "weak_topics": weak_topics,
         "recent_activity": []
@@ -435,3 +501,346 @@ def ats_check(data: ATSRequest, user=Depends(get_current_user)):
     result["analyzed_at"] = datetime.utcnow().isoformat()
     db_save_ats(user["email"], result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Sprint 4: AI Mock Interview (question bank + instant rule-based evaluation)
+# ---------------------------------------------------------------------------
+# Evaluation philosophy: every question carries the key points a strong
+# answer should cover. Answers are scored on key-point coverage (70),
+# depth/length (20) and structure signals like examples and numbers (10),
+# with the matched/missed points returned as feedback. A generative-AI
+# evaluator can later be plugged into evaluate_answer() behind the same API.
+QUESTIONS_PER_SESSION = 5
+
+INTERVIEW_TRACKS = {
+    "data-engineering": {
+        "title": "Data Engineering",
+        "questions": [
+            {"id": "de1", "q": "Explain ETL vs ELT. When would you choose one over the other?",
+             "points": [
+                 {"label": "ETL: transform before loading into the target", "keys": ["transform before", "before loading", "etl"]},
+                 {"label": "ELT: load raw first, transform inside the warehouse", "keys": ["load raw", "raw first", "transform in", "elt"]},
+                 {"label": "Choice depends on data volume / warehouse compute / governance", "keys": ["volume", "warehouse", "compute", "governance", "cost", "compliance"]}],
+             "tip": "Anchor it in a real pipeline: raw layer first, then clean — that is ELT thinking."},
+            {"id": "de2", "q": "What are the different types of SQL JOINs, and when do you use each?",
+             "points": [
+                 {"label": "INNER JOIN returns only matching rows", "keys": ["inner", "matching"]},
+                 {"label": "LEFT JOIN keeps all rows from the left table", "keys": ["left", "all rows from the left", "left table"]},
+                 {"label": "FULL OUTER / RIGHT / CROSS awareness", "keys": ["full", "right", "cross"]},
+                 {"label": "Unmatched rows become NULL in outer joins", "keys": ["null"]}],
+             "tip": "Give a tiny two-table example for one join — examples score well."},
+            {"id": "de3", "q": "What is a window function? Give an example where a GROUP BY cannot do the job.",
+             "points": [
+                 {"label": "Window functions compute across related rows without collapsing them", "keys": ["without collapsing", "does not collapse", "keeps rows", "related rows", "set of rows"]},
+                 {"label": "OVER() and PARTITION BY define the window", "keys": ["over", "partition by"]},
+                 {"label": "Concrete example: RANK / running total / LAG with row detail preserved", "keys": ["rank", "running total", "lag", "row_number", "top 3 per", "per group"]}],
+             "tip": "The classic example: top 3 salaries per department — GROUP BY alone loses the row detail."},
+            {"id": "de4", "q": "How do you make a data pipeline idempotent, and why does it matter?",
+             "points": [
+                 {"label": "Same input produces the same output / safe to re-run", "keys": ["same output", "re-run", "rerun", "safe to run again", "same result"]},
+                 {"label": "Upserts / merge on a natural key instead of blind appends", "keys": ["upsert", "merge", "insert or replace", "natural key", "primary key", "deduplicate"]},
+                 {"label": "Matters because retries and failures must not duplicate data", "keys": ["duplicat", "retr", "fail"]}],
+             "tip": "Mention your own pipeline: INSERT OR REPLACE on the hour timestamp is idempotency in action."},
+            {"id": "de5", "q": "Data warehouse vs data lake vs lakehouse — what is the difference?",
+             "points": [
+                 {"label": "Warehouse: structured, schema-on-write, SQL analytics", "keys": ["structured", "schema-on-write", "schema on write"]},
+                 {"label": "Lake: raw files of any type, schema-on-read", "keys": ["raw", "schema-on-read", "schema on read", "object storage", "files"]},
+                 {"label": "Lakehouse combines both (e.g. Delta/Iceberg)", "keys": ["lakehouse", "delta", "iceberg", "combine", "both"]}],
+             "tip": "One line each is enough — interviewers want the contrast, not an essay."},
+            {"id": "de6", "q": "Your pipeline receives duplicate and late-arriving records. How do you handle them?",
+             "points": [
+                 {"label": "Deduplicate on a business/natural key", "keys": ["dedup", "duplicate", "distinct", "natural key", "unique"]},
+                 {"label": "Watermark / event-time handling for late data", "keys": ["watermark", "late", "event time", "window"]},
+                 {"label": "Data-quality checks that flag or quarantine bad rows", "keys": ["quality check", "validation", "quarantine", "flag", "reject"]}],
+             "tip": "Structure it: detect → decide (drop/merge/quarantine) → make it visible in logs."},
+        ],
+    },
+    "python-sql": {
+        "title": "Python + SQL",
+        "questions": [
+            {"id": "ps1", "q": "List vs tuple in Python — differences and when do you use each?",
+             "points": [
+                 {"label": "Lists are mutable, tuples are immutable", "keys": ["mutable", "immutable"]},
+                 {"label": "Tuples can be dictionary keys / are hashable", "keys": ["hashable", "dictionary key", "dict key"]},
+                 {"label": "Use cases: fixed records vs growing collections", "keys": ["fixed", "coordinates", "return multiple", "collection"]}],
+             "tip": "Immutability first, hashability second, use case third."},
+            {"id": "ps2", "q": "How would you find duplicate values in a SQL table? Write the query approach.",
+             "points": [
+                 {"label": "GROUP BY the column(s)", "keys": ["group by"]},
+                 {"label": "HAVING COUNT(*) > 1 filters the duplicates", "keys": ["having", "count"]},
+                 {"label": "Window function alternative (ROW_NUMBER) to fetch full rows", "keys": ["row_number", "window"]}],
+             "tip": "GROUP BY + HAVING is the core; ROW_NUMBER shows senior-level polish."},
+            {"id": "ps3", "q": "What does an index do in a database, and what is its downside?",
+             "points": [
+                 {"label": "Speeds up reads/lookups (B-tree search instead of full scan)", "keys": ["speed", "faster", "lookup", "b-tree", "btree", "full scan", "search"]},
+                 {"label": "Downside: slower writes and extra storage", "keys": ["slower write", "write", "storage", "space", "overhead"]},
+                 {"label": "Best on filtered/joined columns", "keys": ["where", "join", "filter", "frequently"]}],
+             "tip": "Every index is a trade: read speed paid for with write cost."},
+            {"id": "ps4", "q": "Explain Python generators and why they matter for data work.",
+             "points": [
+                 {"label": "Yield values lazily, one at a time", "keys": ["yield", "lazy", "one at a time"]},
+                 {"label": "Memory efficient for large/streaming data", "keys": ["memory", "large", "stream"]},
+                 {"label": "Example: processing a big file line by line", "keys": ["file", "line", "csv", "log"]}],
+             "tip": "Connect it to pipelines: stream records instead of loading everything into RAM."},
+            {"id": "ps5", "q": "WHERE vs HAVING in SQL — what is the difference?",
+             "points": [
+                 {"label": "WHERE filters rows before grouping", "keys": ["before group", "before aggregation", "individual rows", "row level"]},
+                 {"label": "HAVING filters groups after aggregation", "keys": ["after", "group", "aggregat"]},
+                 {"label": "Aggregates like SUM/COUNT belong in HAVING", "keys": ["sum", "count", "avg", "aggregate function"]}],
+             "tip": "Timeline answer: WHERE → GROUP BY → HAVING → ORDER BY."},
+            {"id": "ps6", "q": "How do you handle missing or null values when cleaning data in pandas?",
+             "points": [
+                 {"label": "Detect them first (isna / value counts / info)", "keys": ["isna", "isnull", "detect", "info"]},
+                 {"label": "Decide per column: drop, fill (mean/median/constant), or flag", "keys": ["dropna", "fillna", "fill", "median", "mean", "impute"]},
+                 {"label": "Never silently guess — document the choice", "keys": ["document", "domain", "reason", "business", "depends"]}],
+             "tip": "The decision matters more than the function name — say why for each column."},
+        ],
+    },
+    "dsa-basics": {
+        "title": "DSA Basics",
+        "questions": [
+            {"id": "dsa1", "q": "Why is binary search O(log n), and what must be true about the input?",
+             "points": [
+                 {"label": "The array must be sorted", "keys": ["sorted"]},
+                 {"label": "Each step halves the search space", "keys": ["half", "halv", "divide"]},
+                 {"label": "log n comes from repeated halving", "keys": ["log", "2^k", "power"]}],
+             "tip": "Say the recurrence out loud: T(n) = T(n/2) + O(1)."},
+            {"id": "dsa2", "q": "When would you use a hash map to solve a problem? Give an example.",
+             "points": [
+                 {"label": "O(1) average lookup / membership testing", "keys": ["o(1)", "constant", "lookup", "membership"]},
+                 {"label": "Example: Two Sum / frequency counting / caching seen values", "keys": ["two sum", "frequency", "count", "seen", "complement"]},
+                 {"label": "Trade-off: extra memory for speed", "keys": ["memory", "space", "trade"]}],
+             "tip": "Two Sum is the perfect 20-second example: store complements as you scan."},
+            {"id": "dsa3", "q": "Stack vs queue — differences and one real use case each.",
+             "points": [
+                 {"label": "Stack is LIFO, queue is FIFO", "keys": ["lifo", "fifo", "last in", "first in"]},
+                 {"label": "Stack use: undo, recursion, bracket matching", "keys": ["undo", "recursion", "bracket", "backtrack", "call stack"]},
+                 {"label": "Queue use: BFS, scheduling, buffers", "keys": ["bfs", "schedul", "buffer", "printer", "task"]}],
+             "tip": "Name the operations too: push/pop vs enqueue/dequeue."},
+            {"id": "dsa4", "q": "BFS vs DFS — how do they differ and when is each better?",
+             "points": [
+                 {"label": "BFS explores level by level using a queue", "keys": ["level", "queue"]},
+                 {"label": "DFS goes deep first using a stack/recursion", "keys": ["deep", "stack", "recursion"]},
+                 {"label": "BFS finds shortest path in unweighted graphs", "keys": ["shortest path", "unweighted", "nearest"]}],
+             "tip": "Shortest path → BFS. Exploring all paths / topological order → DFS."},
+            {"id": "dsa5", "q": "Array vs linked list — trade-offs for access, insert and delete.",
+             "points": [
+                 {"label": "Array: O(1) index access, costly middle inserts", "keys": ["o(1) access", "index", "random access", "shift"]},
+                 {"label": "Linked list: O(1) insert/delete at a known node, O(n) access", "keys": ["insert", "delete", "o(n) access", "pointer"]},
+                 {"label": "Memory/cache behaviour differs", "keys": ["cache", "contiguous", "memory", "pointer overhead"]}],
+             "tip": "Make a mini table in words: access, insert, delete, memory."},
+            {"id": "dsa6", "q": "Quicksort vs mergesort — compare time, space and stability.",
+             "points": [
+                 {"label": "Both average O(n log n); quicksort worst case O(n^2)", "keys": ["n log n", "n^2", "worst"]},
+                 {"label": "Mergesort needs O(n) extra space; quicksort is in-place", "keys": ["o(n) space", "extra space", "in-place", "in place"]},
+                 {"label": "Mergesort is stable, quicksort is not", "keys": ["stable"]}],
+             "tip": "Pivot choice is the quicksort caveat interviewers listen for."},
+        ],
+    },
+    "hr-behavioral": {
+        "title": "HR / Behavioral",
+        "questions": [
+            {"id": "hr1", "q": "Tell me about yourself.",
+             "points": [
+                 {"label": "Present: final-year CSE student and current focus", "keys": ["final year", "final-year", "cse", "student", "currently"]},
+                 {"label": "Proof: a concrete project or internship", "keys": ["project", "built", "internship", "placeprep", "etl", "sail"]},
+                 {"label": "Direction: the role/field you are targeting and why", "keys": ["data engineering", "looking for", "aim", "goal", "interested in"]}],
+             "tip": "Present → proof → direction, in about 60 seconds. No life story."},
+            {"id": "hr2", "q": "Describe a challenging project you worked on. What was hard and how did you handle it?",
+             "points": [
+                 {"label": "Situation: what the project was", "keys": ["project", "building", "built", "develop"]},
+                 {"label": "Challenge: a specific hard problem", "keys": ["challenge", "problem", "bug", "difficult", "stuck", "error"]},
+                 {"label": "Action + result: what you did and the outcome", "keys": ["fixed", "solved", "learned", "result", "finally", "deployed", "worked"]}],
+             "tip": "Use STAR: Situation, Task, Action, Result — with one measurable outcome."},
+            {"id": "hr3", "q": "What is your biggest strength, and one weakness you are actively improving?",
+             "points": [
+                 {"label": "Strength backed by an example", "keys": ["strength", "good at", "example", "because"]},
+                 {"label": "A real but non-fatal weakness", "keys": ["weakness", "improv", "struggle", "working on"]},
+                 {"label": "Concrete steps being taken to improve", "keys": ["practice", "daily", "plan", "course", "routine"]}],
+             "tip": "Weakness + your system to fix it beats a fake weakness every time."},
+            {"id": "hr4", "q": "Why do you want to work in data engineering?",
+             "points": [
+                 {"label": "Genuine interest in data/pipelines", "keys": ["data", "pipeline", "etl", "enjoy", "interest"]},
+                 {"label": "Evidence: something you built or learned", "keys": ["built", "project", "learned", "sql", "python"]},
+                 {"label": "Fit: how it matches your skills and goals", "keys": ["skill", "goal", "career", "fit", "grow"]}],
+             "tip": "Interest + evidence + fit. Your ETL project is your evidence — name it."},
+            {"id": "hr5", "q": "Tell me about a time you disagreed with a teammate. How did you resolve it?",
+             "points": [
+                 {"label": "A specific situation, told neutrally", "keys": ["team", "teammate", "group", "disagree", "different"]},
+                 {"label": "You listened and discussed with data/reasons", "keys": ["discuss", "listen", "understood", "reason", "data", "talked"]},
+                 {"label": "Resolution and what you learned", "keys": ["decided", "agreed", "learned", "compromise", "result"]}],
+             "tip": "Never blame. Process (discuss → decide → commit) is what they score."},
+            {"id": "hr6", "q": "Where do you see yourself in 3 years?",
+             "points": [
+                 {"label": "A clear direction (role/domain)", "keys": ["data engineer", "engineer", "role", "domain"]},
+                 {"label": "Skills/depth you want to own by then", "keys": ["expert", "deep", "speciali", "own", "lead"]},
+                 {"label": "Growth mindset tied to this opportunity", "keys": ["learn", "grow", "contribute", "company", "team"]}],
+             "tip": "Ambitious but anchored: direction + depth + contribution."},
+        ],
+    },
+}
+
+
+def evaluate_answer(question: dict, answer: str) -> dict:
+    text = " " + answer.lower() + " "
+    matched, missed = [], []
+    for point in question["points"]:
+        if any(re.search(r"(?<![a-z0-9])" + re.escape(k) + r"(?![a-z0-9])", text) or k in text
+               for k in point["keys"]):
+            matched.append(point["label"])
+        else:
+            missed.append(point["label"])
+    coverage = len(matched) / len(question["points"]) if question["points"] else 0
+    coverage_points = coverage * 70
+
+    words = len(answer.split())
+    if 40 <= words <= 180:
+        depth_points = 20.0
+    elif 20 <= words < 40 or 180 < words <= 260:
+        depth_points = 13.0
+    elif words >= 8:
+        depth_points = 7.0
+    else:
+        depth_points = 2.0
+
+    structure_signals = 0
+    if re.search(r"for example|e\.g\.|such as|in my project|i built|i used", text):
+        structure_signals += 1
+    if re.search(r"\d", answer):
+        structure_signals += 1
+    if re.search(r"because|so that|therefore|which means|this helps", text):
+        structure_signals += 1
+    structure_points = min(10.0, structure_signals * 4.0)
+
+    score = int(round(coverage_points + depth_points + structure_points))
+    if score >= 80:
+        verdict = "Strong answer"
+    elif score >= 55:
+        verdict = "Decent answer — a few gaps"
+    elif score >= 30:
+        verdict = "Partial — key points missing"
+    else:
+        verdict = "Too thin — needs the core concepts"
+    return {
+        "score": score, "verdict": verdict,
+        "matched_points": matched, "missed_points": missed,
+        "word_count": words, "tip": question["tip"],
+    }
+
+
+class StartInterviewRequest(BaseModel):
+    track: str
+
+
+class AnswerRequest(BaseModel):
+    session_id: str
+    answer: str
+
+
+def public_question(state: dict):
+    idx = state["index"]
+    if idx >= len(state["questions"]):
+        return None
+    q = state["questions"][idx]
+    return {"number": idx + 1, "total": len(state["questions"]), "question": q["q"]}
+
+
+def summarize(state: dict) -> dict:
+    answers = state["answers"]
+    overall = round(sum(a["score"] for a in answers) / len(answers)) if answers else 0
+    per_question = [{
+        "question": a["question"], "score": a["score"],
+        "matched_points": a["matched_points"], "missed_points": a["missed_points"],
+    } for a in answers]
+    strengths = [a["question"] for a in answers if a["score"] >= 70]
+    improvements = []
+    for a in sorted(answers, key=lambda x: x["score"])[:2]:
+        improvements.extend(a["missed_points"][:2])
+    if overall >= 80:
+        grade = "Interview-ready for this track"
+    elif overall >= 55:
+        grade = "Close — polish the gaps below"
+    else:
+        grade = "Keep practising — focus on the missed points"
+    return {
+        "overall_score": overall, "grade": grade,
+        "per_question": per_question,
+        "strengths": strengths, "improvements": improvements,
+    }
+
+
+@app.get("/interview/tracks")
+def interview_tracks():
+    return {"tracks": [
+        {"id": tid, "title": t["title"], "questions_available": len(t["questions"]),
+         "per_session": QUESTIONS_PER_SESSION}
+        for tid, t in INTERVIEW_TRACKS.items()
+    ]}
+
+
+@app.post("/interview/start")
+def interview_start(data: StartInterviewRequest, user=Depends(get_current_user)):
+    track = INTERVIEW_TRACKS.get(data.track)
+    if not track:
+        raise HTTPException(status_code=400, detail="Unknown track. Choose from: " + ", ".join(INTERVIEW_TRACKS))
+    picked = random.sample(track["questions"], min(QUESTIONS_PER_SESSION, len(track["questions"])))
+    state = {
+        "id": uuid.uuid4().hex,
+        "email": user["email"],
+        "track": data.track,
+        "track_title": track["title"],
+        "questions": picked,
+        "index": 0,
+        "answers": [],
+        "status": "active",
+        "summary": None,
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    db_create_interview(state)
+    return {
+        "session_id": state["id"], "track": data.track, "track_title": track["title"],
+        "status": "active", "current": public_question(state),
+    }
+
+
+@app.post("/interview/answer")
+def interview_answer(data: AnswerRequest, user=Depends(get_current_user)):
+    state = db_get_interview(data.session_id)
+    if not state or state["email"] != user["email"]:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    if state["status"] != "active":
+        raise HTTPException(status_code=400, detail="This interview is already finished")
+    if len(data.answer.strip()) < 3:
+        raise HTTPException(status_code=400, detail="Please type an answer first")
+    question = state["questions"][state["index"]]
+    result = evaluate_answer(question, data.answer.strip())
+    state["answers"].append({
+        "question_id": question["id"], "question": question["q"],
+        "answer": data.answer.strip(), **result,
+    })
+    state["index"] += 1
+    finished = state["index"] >= len(state["questions"])
+    if finished:
+        state["status"] = "completed"
+        state["summary"] = summarize(state)
+    db_update_interview(state)
+    return {
+        "feedback": result,
+        "finished": finished,
+        "next": None if finished else public_question(state),
+        "summary": state["summary"] if finished else None,
+    }
+
+
+@app.get("/interview/history")
+def interview_history(user=Depends(get_current_user)):
+    sessions = db_list_interviews(user["email"])
+    return {"sessions": [{
+        "session_id": s["id"], "track": s["track"], "track_title": s["track_title"],
+        "status": s["status"],
+        "overall_score": (s.get("summary") or {}).get("overall_score"),
+        "questions_answered": len(s["answers"]),
+        "created_at": s["created_at"],
+    } for s in sessions]}
