@@ -11,6 +11,11 @@ A placement-preparation platform for final-year students: resume ATS analysis ag
 
 > **Current status (honest):** Sprint 1 is complete (auth + dashboard + schema). Resume upload with ATS scoring and the AI mock-interview modules are **in progress** (Sprint 2+), not yet built.
 
+## 🌐 Live Demo
+- **App:** https://placeprep-ai-cyan.vercel.app — use Sign Up to create an account and try the dashboard
+- **API:** https://placeprep-ai-backend.vercel.app · interactive docs at [/docs](https://placeprep-ai-backend.vercel.app/docs)
+- Deployed on Vercel (frontend: Next.js project; backend: FastAPI as a serverless function via `backend/api/index.py`). Sprint 1 stores users in memory, so accounts reset when the backend restarts — the Sprint 2 database removes this limit.
+
 ## What is DONE in Sprint 1
 - [x] Landing page
 - [x] Signup / Login UI + API (JWT Auth, password hashing)
