@@ -4,12 +4,12 @@
 ![Next.js](https://img.shields.io/badge/Next.js-14-000000?style=flat&logo=nextdotjs&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat&logo=fastapi&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/DB-Supabase%20%2F%20PostgreSQL-4169E1?style=flat&logo=postgresql&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Sprint%204%20complete-brightgreen?style=flat)
+![Status](https://img.shields.io/badge/Status-Sprint%205%20complete-brightgreen?style=flat)
 
 BTech CSE Final-Year Major Project — GD Goenka University, Gurugram.
 A placement-preparation platform for final-year students: resume ATS analysis against a job description, real-time AI mock interviews with feedback, and a student readiness dashboard.
 
-> **Current status (honest):** Sprints 1–4 are complete and live (auth, dashboard, resume upload + ATS scoring, Supabase persistence, mock interviews). Interview answers are scored instantly by a transparent key-point evaluation engine (coverage, depth, structure); a generative-AI evaluator can be plugged in behind the same API in a later sprint. Voice interviews are a future sprint, not yet built.
+> **Current status (honest):** Sprints 1–5 are complete and live (auth, dashboard, resume upload + ATS scoring, Supabase persistence, mock interviews, voice mode, readiness analytics, TPO view). Interview answers are scored instantly by a transparent key-point evaluation engine (coverage, depth, structure); a generative-AI evaluator can be plugged in behind the same API in a later sprint. Voice mode uses the browser's built-in Web Speech API (speech recognition + synthesis) — no external speech service or API key.
 
 ## 🌐 Live Demo
 - **App:** https://placeprep-ai-cyan.vercel.app — use Sign Up to create an account, upload your resume PDF, and run an ATS check against any job description
@@ -65,7 +65,8 @@ placeprep-ai/
 - [x] **Sprint 2** — Resume upload (PDF) + text extraction + ATS score vs job description (skill match, sections, length, action verbs) — live
 - [x] **Sprint 3** — Database persistence (Supabase Postgres) for users, resumes and ATS results — live
 - [x] **Sprint 4** — AI mock interview: 4 tracks (Data Engineering, Python+SQL, DSA, HR), 5 questions/session, instant per-answer scoring with matched/missed key points, session summary, history; readiness score blends ATS + interview average — live
-- [ ] **Sprint 5** — Voice interviews, readiness analytics, TPO/admin view
+- [x] **Sprint 5** — Voice interviews (Web Speech API: questions read aloud, answers dictated and scored through the same engine, per-answer voice tagging), readiness analytics (score trend, per-track averages, recurring missed key points, readiness breakdown), TPO view (cohort stats + per-student readiness table for placement-cell accounts) — live
+- [ ] **Sprint 6 (idea)** — Generative-AI evaluator (Gemini) behind `evaluate_answer()`, company-specific interview tracks
 
 ## Deployment (Final Sprint)
 Frontend -> Vercel | Backend -> Render | DB -> Supabase (all free)

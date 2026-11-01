@@ -1,7 +1,8 @@
 """
-PlacePrep AI - Backend (Sprints 1-3)
+PlacePrep AI - Backend (Sprints 1-5)
 FastAPI: Health, Signup, Login (JWT), Me, Dashboard Stats,
-         Resume Upload (PDF) + Text Extraction + ATS Scoring vs a Job Description
+         Resume Upload (PDF) + Text Extraction + ATS Scoring vs a Job Description,
+         Mock Interviews with instant scoring, Readiness Analytics, TPO Overview
 Run: uvicorn main:app --reload --port 8000
 Docs: http://localhost:8000/docs
 Storage: Supabase Postgres via PostgREST when SUPABASE_URL + SUPABASE_KEY
@@ -243,7 +244,7 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
 
 @app.get("/")
 def health():
-    return {"status": "ok", "project": "PlacePrep AI", "sprint": 4,
+    return {"status": "ok", "project": "PlacePrep AI", "sprint": 5,
             "storage": "supabase" if DB_ENABLED else "memory"}
 
 @app.post("/auth/signup")
@@ -739,6 +740,9 @@ class StartInterviewRequest(BaseModel):
 class AnswerRequest(BaseModel):
     session_id: str
     answer: str
+    # Sprint 5: "voice" when the answer was dictated with the microphone,
+    # "text" when typed. Recorded per answer for analytics.
+    input_mode: str = "text"
 
 
 def public_question(state: dict):
@@ -770,6 +774,7 @@ def summarize(state: dict) -> dict:
         "overall_score": overall, "grade": grade,
         "per_question": per_question,
         "strengths": strengths, "improvements": improvements,
+        "voice_answers": sum(1 for a in answers if a.get("input_mode") == "voice"),
     }
 
 
@@ -821,7 +826,9 @@ def interview_answer(data: AnswerRequest, user=Depends(get_current_user)):
     result = evaluate_answer(question, data.answer.strip())
     state["answers"].append({
         "question_id": question["id"], "question": question["q"],
-        "answer": data.answer.strip(), **result,
+        "answer": data.answer.strip(),
+        "input_mode": "voice" if data.input_mode == "voice" else "text",
+        **result,
     })
     state["index"] += 1
     finished = state["index"] >= len(state["questions"])
@@ -847,3 +854,161 @@ def interview_history(user=Depends(get_current_user)):
         "questions_answered": len(s["answers"]),
         "created_at": s["created_at"],
     } for s in sessions]}
+
+
+# ---------------------------------------------------------------------------
+# Sprint 5: Readiness analytics + TPO overview
+# Voice mode itself lives in the browser (Web Speech API): the interviewer
+# reads questions aloud and answers are dictated into the same scoring flow,
+# tagged input_mode="voice" per answer. Analytics below are computed from the
+# stored session states, so no extra tables are needed.
+# ---------------------------------------------------------------------------
+from collections import Counter
+
+
+def _sb_list_all(table: str):
+    with httpx.Client(timeout=15) as client:
+        res = client.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_sb_headers(),
+            params={"select": "*"},
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+def db_list_all_users():
+    if DB_ENABLED:
+        return _sb_list_all("app_users")
+    return list(users_db.values())
+
+
+def db_list_all_interviews():
+    if DB_ENABLED:
+        return [row["state"] for row in _sb_list_all("app_interviews")]
+    return list(interviews_db.values())
+
+
+def _readiness_for(email: str, sessions: list) -> dict:
+    """Readiness math shared by /dashboard/stats, /analytics/me and /tpo/overview:
+    50 points from the ATS score + 50 from the average interview score."""
+    last_ats = db_get_ats(email)
+    completed = [s for s in sessions
+                 if s.get("status") == "completed" and s.get("summary")]
+    interview_avg = (sum(s["summary"]["overall_score"] for s in completed)
+                     / len(completed)) if completed else None
+    ats_score = last_ats["score"] if last_ats else 0
+    readiness = 0
+    if last_ats:
+        readiness += round(ats_score * 0.5)
+    if interview_avg is not None:
+        readiness += round(interview_avg * 0.5)
+    return {
+        "ats_score": ats_score,
+        "ats_points": round(ats_score * 0.5) if last_ats else 0,
+        "interviews_completed": len(completed),
+        "interview_avg": round(interview_avg) if interview_avg is not None else None,
+        "interview_points": round(interview_avg * 0.5) if interview_avg is not None else 0,
+        "readiness_score": readiness,
+    }
+
+
+@app.get("/analytics/me")
+def my_analytics(user=Depends(get_current_user)):
+    email = user["email"]
+    sessions = db_list_interviews(email)
+    base = _readiness_for(email, sessions)
+    completed = sorted(
+        [s for s in sessions if s.get("status") == "completed" and s.get("summary")],
+        key=lambda s: s["created_at"],
+    )
+
+    trend = [{
+        "date": s["created_at"], "track": s["track"],
+        "track_title": s["track_title"],
+        "score": s["summary"]["overall_score"],
+    } for s in completed]
+
+    by_track = {}
+    for s in completed:
+        slot = by_track.setdefault(s["track"], {
+            "track": s["track"], "track_title": s["track_title"],
+            "sessions": 0, "scores": [],
+        })
+        slot["sessions"] += 1
+        slot["scores"].append(s["summary"]["overall_score"])
+    track_stats = [{
+        "track": t["track"], "track_title": t["track_title"],
+        "sessions": t["sessions"],
+        "avg_score": round(sum(t["scores"]) / len(t["scores"])),
+        "best_score": max(t["scores"]),
+    } for t in by_track.values()]
+
+    missed = Counter()
+    total_answers = 0
+    total_words = 0
+    voice_answers = 0
+    for s in sessions:
+        for a in s.get("answers", []):
+            total_answers += 1
+            total_words += a.get("word_count", 0)
+            if a.get("input_mode") == "voice":
+                voice_answers += 1
+            for point in a.get("missed_points", []):
+                missed[point] += 1
+    recurring_gaps = [{"point": p, "times_missed": n}
+                      for p, n in missed.most_common(5)]
+
+    return {
+        **base,
+        "has_resume": db_get_resume(email) is not None,
+        "trend": trend,
+        "score_delta": (trend[-1]["score"] - trend[0]["score"]) if len(trend) >= 2 else None,
+        "tracks": track_stats,
+        "recurring_gaps": recurring_gaps,
+        "practice": {
+            "total_answers": total_answers,
+            "total_words": total_words,
+            "avg_words_per_answer": round(total_words / total_answers) if total_answers else 0,
+            "voice_answers": voice_answers,
+        },
+    }
+
+
+@app.get("/tpo/overview")
+def tpo_overview(user=Depends(get_current_user)):
+    if user.get("role") != "tpo":
+        raise HTTPException(status_code=403,
+                            detail="TPO view is available to placement-cell (TPO) accounts only")
+    all_sessions = db_list_all_interviews()
+    by_email = {}
+    for s in all_sessions:
+        by_email.setdefault(s["email"], []).append(s)
+
+    students = []
+    for u in db_list_all_users():
+        if u.get("role") == "tpo":
+            continue
+        mine = by_email.get(u["email"], [])
+        stats = _readiness_for(u["email"], mine)
+        last_active = None
+        if mine:
+            last_active = max(s["created_at"] for s in mine)
+        students.append({
+            "name": u["name"], "email": u["email"],
+            "has_resume": db_get_resume(u["email"]) is not None,
+            **stats, "last_active": last_active,
+        })
+    students.sort(key=lambda s: s["readiness_score"], reverse=True)
+
+    n = len(students)
+    return {
+        "cohort": {
+            "total_students": n,
+            "students_with_resume": sum(1 for s in students if s["has_resume"]),
+            "students_interviewed": sum(1 for s in students if s["interviews_completed"] > 0),
+            "total_interviews": sum(s["interviews_completed"] for s in students),
+            "avg_readiness": round(sum(s["readiness_score"] for s in students) / n) if n else 0,
+        },
+        "students": students,
+    }

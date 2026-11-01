@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiGet, apiPost, apiUpload } from "../../lib/api";
 
@@ -26,6 +26,15 @@ export default function Dashboard() {
   const [iBusy, setIBusy] = useState(false);
   const [iError, setIError] = useState("");
 
+  // Sprint 5: voice mode (Web Speech API) + analytics + TPO view
+  const [analytics, setAnalytics] = useState(null);
+  const [tpo, setTpo] = useState(null);
+  const [voiceOn, setVoiceOn] = useState(false);
+  const [voiceSupported, setVoiceSupported] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [usedVoice, setUsedVoice] = useState(false);
+  const recogRef = useRef(null);
+
   function loadAll(token) {
     apiGet("/dashboard/stats", token).then(setStats).catch(() => {});
     apiGet("/resume/me", token).then((r) => {
@@ -33,6 +42,7 @@ export default function Dashboard() {
       if (r && r.last_ats) setResult(r.last_ats);
     }).catch(() => {});
     apiGet("/interview/history", token).then((h) => setHistory(h.sessions || [])).catch(() => {});
+    apiGet("/analytics/me", token).then(setAnalytics).catch(() => {});
   }
 
   useEffect(() => {
@@ -42,7 +52,55 @@ export default function Dashboard() {
     if (saved) setUser(JSON.parse(saved));
     loadAll(token);
     apiGet("/interview/tracks", token).then((t) => setTracks(t.tracks || [])).catch(() => {});
+    const parsed = saved ? JSON.parse(saved) : null;
+    if (parsed?.role === "tpo") {
+      apiGet("/tpo/overview", token).then(setTpo).catch(() => {});
+    }
+    setVoiceSupported(
+      typeof window !== "undefined" &&
+      (!!window.speechSynthesis || !!(window.SpeechRecognition || window.webkitSpeechRecognition))
+    );
   }, [router]);
+
+  // Sprint 5 voice helpers -------------------------------------------------
+  function speak(text) {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "en-IN";
+    u.rate = 1.02;
+    window.speechSynthesis.speak(u);
+  }
+
+  // Read each new question aloud while voice mode is on.
+  useEffect(() => {
+    if (voiceOn && session?.current?.question) speak(session.current.question);
+    setUsedVoice(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.current?.number, session?.session_id]);
+
+  function toggleListening() {
+    if (listening) { recogRef.current?.stop(); return; }
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { setIError("Voice input is not supported in this browser — Chrome works best."); return; }
+    const rec = new SR();
+    rec.lang = "en-IN";
+    rec.interimResults = true;
+    rec.continuous = true;
+    rec.onresult = (e) => {
+      let finalText = "";
+      for (const r of e.results) if (r.isFinal) finalText += r[0].transcript + " ";
+      if (finalText) {
+        setUsedVoice(true);
+        setAnswerText((prev) => (prev ? prev.replace(/\s+$/, "") + " " : "") + finalText.trim() + " ");
+      }
+    };
+    rec.onend = () => setListening(false);
+    rec.onerror = () => setListening(false);
+    recogRef.current = rec;
+    setListening(true);
+    rec.start();
+  }
 
   async function handleUpload() {
     if (!file) { setError("Choose a PDF resume first"); return; }
@@ -84,9 +142,10 @@ export default function Dashboard() {
     setIBusy(true); setIError("");
     try {
       const token = localStorage.getItem("token");
-      const r = await apiPost("/interview/answer", { session_id: session.session_id, answer: answerText }, token);
+      const r = await apiPost("/interview/answer", { session_id: session.session_id, answer: answerText, input_mode: usedVoice ? "voice" : "text" }, token);
       setFeedback(r.feedback);
       setAnswerText("");
+      if (listening) recogRef.current?.stop();
       if (r.finished) {
         setSummary(r.summary);
         setSession(null);
@@ -131,8 +190,8 @@ export default function Dashboard() {
       )}
 
       <div className="card mt-6">
-        <h2 className="font-semibold text-lg">🎤 AI Mock Interview — Sprint 4</h2>
-        <p className="text-sm text-slate-600 mt-1">Five questions per session, scored instantly on key-point coverage, depth and structure — with the exact points you hit and missed.</p>
+        <h2 className="font-semibold text-lg">🎤 AI Mock Interview — now with Voice (Sprint 5)</h2>
+        <p className="text-sm text-slate-600 mt-1">Five questions per session, scored instantly on key-point coverage, depth and structure — with the exact points you hit and missed. Turn on Voice Mode and the interviewer reads each question aloud; answer by speaking, just like a real interview.</p>
 
         {!session && !summary && (
           <div className="flex flex-wrap items-center gap-3 mt-4">
@@ -140,17 +199,31 @@ export default function Dashboard() {
               {tracks.map((t) => <option key={t.id} value={t.id}>{t.title} ({t.per_session} questions)</option>)}
             </select>
             <button onClick={startInterview} disabled={iBusy} className="bg-indigo-600 text-white px-4 py-2 rounded-lg disabled:opacity-50">{iBusy ? "Starting..." : "Start Interview"}</button>
+            <label className="flex items-center gap-2 text-sm text-slate-600">
+              <input type="checkbox" checked={voiceOn} onChange={(e) => setVoiceOn(e.target.checked)} disabled={!voiceSupported} />
+              🔊 Voice Mode {voiceSupported ? "" : "(not supported in this browser — try Chrome)"}
+            </label>
           </div>
         )}
 
         {session && (
           <div className="mt-4">
             <p className="text-sm text-slate-500">{session.track_title} • Question {session.current.number} of {session.current.total}</p>
-            <p className="font-medium mt-1">{session.current.question}</p>
+            <p className="font-medium mt-1">{session.current.question}
+              {voiceSupported && <button onClick={() => speak(session.current.question)} className="ml-3 text-indigo-600 text-sm underline">🔊 Hear question</button>}
+            </p>
             <textarea value={answerText} onChange={(e) => setAnswerText(e.target.value)} rows={6}
-              placeholder="Type your answer as you would say it — aim for 40-180 words, cover the key concepts, and add a concrete example..."
+              placeholder="Type your answer — or tap the mic and speak it. Aim for 40-180 words, cover the key concepts, and add a concrete example..."
               className="w-full border rounded-lg p-3 mt-3 text-sm" />
-            <button onClick={submitAnswer} disabled={iBusy} className="bg-emerald-600 text-white px-4 py-2 rounded-lg mt-3 disabled:opacity-50">{iBusy ? "Scoring..." : "Submit Answer"}</button>
+            <div className="flex flex-wrap items-center gap-3 mt-3">
+              <button onClick={submitAnswer} disabled={iBusy} className="bg-emerald-600 text-white px-4 py-2 rounded-lg disabled:opacity-50">{iBusy ? "Scoring..." : "Submit Answer"}</button>
+              {voiceSupported && (
+                <button onClick={toggleListening} className={`px-4 py-2 rounded-lg border ${listening ? "bg-red-600 text-white border-red-600" : ""}`}>
+                  {listening ? "🔴 Listening… tap to stop" : "🎙️ Answer by voice"}
+                </button>
+              )}
+              {usedVoice && !listening && <span className="text-xs text-slate-500">Voice answer — edit the transcript if needed, then submit.</span>}
+            </div>
           </div>
         )}
 
@@ -177,6 +250,7 @@ export default function Dashboard() {
               ))}
             </div>
             {summary.improvements?.length > 0 && <p className="text-sm mt-3"><b>Revise these points:</b> {summary.improvements.join(" · ")}</p>}
+            {summary.voice_answers > 0 && <p className="text-sm mt-2 text-slate-600">🎙️ {summary.voice_answers} of {summary.per_question.length} answers given by voice.</p>}
             <button onClick={() => { setSummary(null); setFeedback(null); }} className="border px-4 py-2 rounded-lg mt-4 text-sm">Start Another Interview</button>
           </div>
         )}
@@ -192,6 +266,57 @@ export default function Dashboard() {
           </div>
         )}
       </div>
+
+      {analytics && (analytics.interviews_completed > 0 || analytics.has_resume) && (
+        <div className="card mt-6">
+          <h2 className="font-semibold text-lg">📊 Your Insights — Sprint 5</h2>
+          <div className="grid md:grid-cols-2 gap-6 mt-4">
+            <div>
+              <p className="text-sm font-medium">Readiness breakdown</p>
+              <div className="max-w-sm">
+                {bar("Resume (ATS)", analytics.ats_score, 100)}
+                <p className="text-xs text-slate-500 mt-1">Contributes {analytics.ats_points}/50 points</p>
+                {bar("Interviews (average)", analytics.interview_avg ?? 0, 100)}
+                <p className="text-xs text-slate-500 mt-1">Contributes {analytics.interview_points}/50 points</p>
+              </div>
+              <p className="text-sm mt-4 text-slate-600">
+                Practice so far: <b>{analytics.practice.total_answers}</b> answers • <b>{analytics.practice.total_words}</b> words
+                {analytics.practice.voice_answers > 0 && <> • <b>{analytics.practice.voice_answers}</b> by voice 🎙️</>}
+                {analytics.score_delta != null && <> • Score trend: <b>{analytics.score_delta >= 0 ? "+" : ""}{analytics.score_delta}</b> since your first interview</>}
+              </p>
+            </div>
+            <div>
+              <p className="text-sm font-medium">Score trend</p>
+              {analytics.trend.length > 0 ? (
+                <div className="flex items-end gap-2 h-28 mt-2 border-b border-slate-200 pb-0">
+                  {analytics.trend.slice(-8).map((t, i) => (
+                    <div key={i} className="flex flex-col items-center justify-end h-full flex-1">
+                      <span className="text-xs font-medium">{t.score}</span>
+                      <div className="w-full max-w-8 bg-indigo-500 rounded-t" style={{ height: `${Math.max(8, t.score)}%` }} title={`${t.track_title}: ${t.score}`} />
+                      <span className="text-[10px] text-slate-500 mt-1">{new Date(t.date).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="text-sm text-slate-500 mt-2">Finish an interview to start your trend.</p>}
+              {analytics.tracks.length > 0 && (
+                <div className="mt-4 space-y-1 text-sm">
+                  {analytics.tracks.map((t) => (
+                    <p key={t.track} className="text-slate-600">{t.track_title}: avg <b>{t.avg_score}</b> • best <b>{t.best_score}</b> • {t.sessions} session{t.sessions > 1 ? "s" : ""}</p>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          {analytics.recurring_gaps.length > 0 && (
+            <div className="mt-4 border-t pt-4">
+              <p className="text-sm font-medium">Recurring gaps — points you keep missing</p>
+              <p className="mt-2">{analytics.recurring_gaps.map((g, i) => (
+                <span key={i} className="inline-block bg-amber-50 border border-amber-200 rounded px-2 py-0.5 mr-1 mt-1 text-xs">{g.point} ×{g.times_missed}</span>
+              ))}</p>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="card mt-6">
         <h2 className="font-semibold text-lg">📄 Resume & ATS Check — Sprint 2</h2>
@@ -244,6 +369,40 @@ export default function Dashboard() {
         )}
       </div>
 
+      {tpo && (
+        <div className="card mt-6">
+          <h2 className="font-semibold text-lg">🏫 TPO Overview — Sprint 5</h2>
+          <p className="text-sm text-slate-600 mt-1">Placement-cell view of the whole cohort.</p>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mt-4 text-center">
+            <div><p className="text-2xl font-bold">{tpo.cohort.total_students}</p><p className="text-xs text-slate-500">Students</p></div>
+            <div><p className="text-2xl font-bold">{tpo.cohort.students_with_resume}</p><p className="text-xs text-slate-500">With resume</p></div>
+            <div><p className="text-2xl font-bold">{tpo.cohort.students_interviewed}</p><p className="text-xs text-slate-500">Interviewed</p></div>
+            <div><p className="text-2xl font-bold">{tpo.cohort.total_interviews}</p><p className="text-xs text-slate-500">Interviews done</p></div>
+            <div><p className="text-2xl font-bold">{tpo.cohort.avg_readiness}%</p><p className="text-xs text-slate-500">Avg readiness</p></div>
+          </div>
+          {tpo.students.length > 0 && (
+            <div className="overflow-x-auto mt-4">
+              <table className="w-full text-sm">
+                <thead><tr className="text-left text-slate-500 border-b">
+                  <th className="py-2 pr-3">Student</th><th className="py-2 pr-3">ATS</th><th className="py-2 pr-3">Interviews</th><th className="py-2 pr-3">Interview avg</th><th className="py-2">Readiness</th>
+                </tr></thead>
+                <tbody>
+                  {tpo.students.map((s) => (
+                    <tr key={s.email} className="border-b border-slate-100">
+                      <td className="py-2 pr-3"><b>{s.name}</b><span className="block text-xs text-slate-500">{s.email}</span></td>
+                      <td className="py-2 pr-3">{s.has_resume ? s.ats_score : "—"}</td>
+                      <td className="py-2 pr-3">{s.interviews_completed}</td>
+                      <td className="py-2 pr-3">{s.interview_avg ?? "—"}</td>
+                      <td className="py-2 font-semibold">{s.readiness_score}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="card mt-6">
         <h2 className="font-semibold text-lg">Next Steps - Sprint Roadmap</h2>
         <ol className="list-decimal ml-5 mt-3 space-y-2 text-slate-600">
@@ -251,7 +410,8 @@ export default function Dashboard() {
           <li><b>Sprint 2 (Done):</b> Resume upload & ATS scoring</li>
           <li><b>Sprint 3 (Done):</b> Database persistence (Supabase)</li>
           <li><b>Sprint 4 (Done):</b> AI Mock Interview with instant scoring</li>
-          <li><b>Sprint 5:</b> Voice interviews + readiness analytics</li>
+          <li><b>Sprint 5 (Done):</b> Voice interviews + readiness analytics + TPO view</li>
+          <li><b>Sprint 6 (idea):</b> Generative-AI evaluator + company-specific interview tracks</li>
         </ol>
       </div>
     </main>
